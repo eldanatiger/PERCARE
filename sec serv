@@ -1,0 +1,275 @@
+import json
+import base64
+import threading
+import time
+from io import BytesIO
+
+from flask import Flask, request, jsonify, render_template_string
+from PIL import Image
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Global variables to store the latest data
+latest_data = {
+    "distance": 0.0,
+    "humidity": 0.0,
+    "temperature": 0.0,
+    "water": 0,
+    "image_b64": "data:image/png;base64," # Placeholder for an empty image/logo
+}
+
+# Lock for thread-safe access to latest_data
+data_lock = threading.Lock()
+
+# --- FLASK ROUTES ---
+
+@app.route('/upload', methods=['POST'])
+def upload_data():
+    """Receives data and image from the Raspberry Pi client."""
+    
+    # 1. Get Sensor Data (sent as a JSON string in 'json_data' field)
+    try:
+        json_data = request.form.get('json_data')
+        if not json_data:
+            return jsonify({"status": "error", "message": "Missing JSON data"}), 400
+            
+        data = json.loads(json_data)
+        
+        distance = data.get("distance", 0.0)
+        humidity = data.get("humidity", 0.0)
+        temperature = data.get("temperature", 0.0)
+        water = data.get("water", 0)
+
+    except json.JSONDecodeError:
+        return jsonify({"status": "error", "message": "Invalid JSON format"}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+    # 2. Get Image Data (sent as a file in 'image' field)
+    image_file = request.files.get('image')
+    image_b64 = None
+    if image_file:
+        try:
+            # Read the file data
+            img_bytes = image_file.read()
+            
+            # Convert bytes to base64 string for embedding in HTML
+            image_b64 = base64.b64encode(img_bytes).decode('utf-8')
+            image_b64_url = f"data:image/jpeg;base64,{image_b64}"
+            
+        except Exception as e:
+            print(f"Error processing image: {e}")
+            
+    # 3. Update global state
+    with data_lock:
+        latest_data["distance"] = distance
+        latest_data["humidity"] = humidity
+        latest_data["temperature"] = temperature
+        latest_data["water"] = water
+        if image_b64_url:
+            latest_data["image_b64"] = image_b64_url
+
+    return jsonify({"status": "success", "message": "Data received successfully"})
+
+@app.route('/data')
+def get_latest_data():
+    """Endpoint for the frontend to fetch the latest sensor data and image."""
+    with data_lock:
+        # Return a copy of the latest data
+        return jsonify(latest_data.copy())
+
+@app.route('/')
+def index():
+    """Renders the main monitoring dashboard."""
+    # Embedded HTML/CSS/JS for the dashboard interface
+    html_template = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cave Scanner Dashboard</title>
+    <!-- Using standard CSS for a clean, responsive layout -->
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #1a202c; color: #e2e8f0; margin: 0; padding: 20px; }
+        .dashboard { max-width: 1200px; margin: 0 auto; display: grid; gap: 20px; grid-template-columns: repeat(3, 1fr); }
+        .card { background-color: #2d3748; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2); }
+        h1 { grid-column: 1 / -1; text-align: center; color: #4299e1; margin-bottom: 30px; }
+        h2 { border-bottom: 2px solid #4a5568; padding-bottom: 10px; margin-top: 0; }
+        
+        /* Camera Feed */
+        #camera-feed-card { grid-column: span 2; }
+        #camera-feed { width: 100%; height: auto; border-radius: 8px; background-color: #000; display: block; }
+        
+        /* DHT Table */
+        table { width: 100%; border-collapse: separate; border-spacing: 0; margin-top: 15px; }
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #4a5568; }
+        th { background-color: #4a5568; border-top-left-radius: 8px; border-top-right-radius: 8px; }
+        .warning-title { color: #f56565; font-weight: bold; }
+
+        /* Water Status */
+        #water-status { font-size: 1.5rem; font-weight: bold; margin-top: 10px; }
+        .water-on { color: #48bb78; }
+        .water-off { color: #f6ad55; }
+
+        /* Radar Illustration */
+        #radar-card { grid-column: 3 / 4; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+        .radar-container {
+            width: 100%; max-width: 300px; aspect-ratio: 2/1; margin: 20px 0;
+            position: relative; overflow: hidden; border-bottom-left-radius: 300px;
+            border-bottom-right-radius: 300px; background-color: #1a202c; border: 3px solid #38b2ac;
+        }
+        .distance-arc {
+            position: absolute; bottom: 0; left: 50%; transform: translateX(-50%);
+            height: 100%; width: 200%; transition: all 0.5s ease-out; opacity: 0.7;
+            border-radius: 0 0 100% 100%; 
+            /* Initial state (full range - green) */
+            background: linear-gradient(to bottom, transparent 0%, rgba(72, 187, 120, 0.8) 100%);
+        }
+        #distance-text { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 1.25rem; font-weight: bold; z-index: 10;}
+        .radar-line { position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); width: 2px; height: 100%; background-color: #38b2ac; animation: scan 3s infinite linear; transform-origin: bottom center; }
+
+        @keyframes scan {
+            0% { transform: translateX(-50%) rotate(-90deg); }
+            50% { transform: translateX(-50%) rotate(90deg); }
+            100% { transform: translateX(-50%) rotate(-90deg); }
+        }
+
+        /* Responsive adjustments */
+        @media (max-width: 768px) {
+            .dashboard { grid-template-columns: 1fr; }
+            #camera-feed-card { grid-column: span 1; }
+            #radar-card { grid-column: span 1; }
+        }
+    </style>
+    <script>
+        const API_URL = '/data';
+        const WARNING_TEMP = 100; // User-specified 100 degrees for warning
+
+        async function updateDashboard() {
+            try {
+                const response = await fetch(API_URL);
+                const data = await response.json();
+
+                // --- 1. Update Camera Feed ---
+                document.getElementById('camera-feed').src = data.image_b64;
+
+                // --- 2. Update DHT/Environmental Data ---
+                const tempCell = document.getElementById('temp-value');
+                const humCell = document.getElementById('hum-value');
+                const tempTitle = document.getElementById('temp-title');
+                
+                tempCell.textContent = `${data.temperature.toFixed(1)} °C`;
+                humCell.textContent = `${data.humidity.toFixed(1)} %`;
+
+                // Handle the 100 degree warning requirement
+                if (data.temperature >= WARNING_TEMP) {
+                    tempTitle.textContent = "WARNING: HIGH TEMPERATURE";
+                    tempTitle.classList.add('warning-title');
+                } else {
+                    tempTitle.textContent = "Temperature";
+                    tempTitle.classList.remove('warning-title');
+                }
+                
+                // --- 3. Update Water Status ---
+                const waterStatusEl = document.getElementById('water-status');
+                if (data.water === 1) {
+                    waterStatusEl.textContent = "Water Pumps: ON (Moisture Detected)";
+                    waterStatusEl.className = 'water-on';
+                } else {
+                    waterStatusEl.textContent = "Water Pumps: OFF (Dry)";
+                    waterStatusEl.className = 'water-off';
+                }
+
+                // --- 4. Update Radar Illustration ---
+                const arc = document.getElementById('distance-arc');
+                const distanceText = document.getElementById('distance-text');
+                const distance = data.distance;
+
+                distanceText.textContent = `${distance.toFixed(1)} cm`;
+                
+                let arcColor = 'rgba(72, 187, 120, 0.8)'; // Green (Safe)
+                let arcHeight = '100%'; 
+
+                if (distance < 20) {
+                    // Critical proximity (Obstacle)
+                    arcColor = 'rgba(245, 101, 101, 0.8)'; // Red
+                    arcHeight = '25%'; // Smallest range
+                } else if (distance < 50) {
+                    // Caution proximity
+                    arcColor = 'rgba(246, 173, 85, 0.8)'; // Yellow
+                    arcHeight = '50%';
+                } else if (distance < 100) {
+                    // Clear but visible
+                    arcColor = 'rgba(66, 153, 225, 0.8)'; // Blue
+                    arcHeight = '75%';
+                }
+                // Over 100cm (full range) remains green/default.
+
+                arc.style.background = `linear-gradient(to bottom, transparent 0%, ${arcColor} 100%)`;
+                arc.style.height = arcHeight;
+
+
+            } catch (error) {
+                console.error('Error fetching data:', error);
+            }
+        }
+
+        // Fetch data every 250 milliseconds
+        document.addEventListener('DOMContentLoaded', () => {
+            setInterval(updateDashboard, 250);
+            updateDashboard(); // Initial load
+        });
+    </script>
+</head>
+<body>
+    <div class="dashboard">
+        <h1>Cave Exploration Robot Monitoring Dashboard</h1>
+
+        <!-- Camera Stream Card -->
+        <div class="card" id="camera-feed-card">
+            <h2>Live Camera Stream (Current View)</h2>
+            <img id="camera-feed" src="https://placehold.co/320x240/1a202c/e2e8f0?text=Waiting+for+Robot+Feed" alt="Camera Feed">
+        </div>
+
+        <!-- Radar and Ultrasonic Card -->
+        <div class="card" id="radar-card">
+            <h2>Ultrasonic Range (Radar)</h2>
+            <p>Visualizing distance to the nearest object.</p>
+            <div class="radar-container">
+                <div id="distance-arc" class="distance-arc"></div>
+                <div class="radar-line"></div>
+                <div id="distance-text">0.0 cm</div>
+            </div>
+            <p id="water-status" class="water-off">Water Pumps: OFF (Dry)</p>
+        </div>
+
+        <!-- DHT Sensor Table Card -->
+        <div class="card">
+            <h2>Environmental Sensors (DHT11)</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th id="temp-title">Temperature</th>
+                        <th>Humidity</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td id="temp-value">0.0 °C</td>
+                        <td id="hum-value">0.0 %</td>
+                    </tr>
+                </tbody>
+            </table>
+            <p style="margin-top: 20px; font-size: 0.8rem; color: #a0aec0;">Note: Robot movement is halted if distance is less than 20 cm.</p>
+        </div>
+    </div>
+</body>
+</html>
+    """
+    return render_template_string(html_template)
+
+if __name__ == '__main__':
+    # Run the server on all available interfaces on port 5000
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
