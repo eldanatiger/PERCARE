@@ -1,0 +1,262 @@
+import RPi.GPIO as GPIO
+
+import time
+
+import requests
+
+import Adafruit_DHT
+
+import cv2
+
+### ---------- ПИНЫ ---------- ###
+
+# Ultrasonic
+
+TRIG = 23
+
+ECHO = 24
+
+# Driver 1 – движение
+
+IN1 = 5
+
+IN2 = 6
+
+IN3 = 13
+
+IN4 = 19
+
+# ENABLE драйвер 1
+
+ENA1 = 22
+
+ENB1 = 27
+
+# Driver 2 – моторы воды
+
+W1_IN1 = 20
+
+W1_IN2 = 21
+
+W2_IN1 = 16
+
+W2_IN2 = 12
+
+# ENABLE драйвер 2
+
+ENA2 = 18
+
+ENB2 = 17
+
+# DHT
+
+DHT_PIN = 4
+
+SERVER_URL = "http://YOUR_SERVER_IP:5000/upload"
+
+
+### ---------- ИНИЦИАЛИЗАЦИЯ ---------- ###
+
+GPIO.setmode(GPIO.BCM)
+
+GPIO.setup([TRIG, IN1, IN2, IN3, IN4,
+
+           ENA1, ENB1,
+
+           W1_IN1, W1_IN2, W2_IN1, W2_IN2,
+
+           ENA2, ENB2], GPIO.OUT)
+
+GPIO.setup(ECHO, GPIO.IN)
+
+# PWM драйвер 1
+
+pwm_ena1 = GPIO.PWM(ENA1, 1000)
+
+pwm_enb1 = GPIO.PWM(ENB1, 1000)
+
+# PWM драйвер 2
+
+pwm_ena2 = GPIO.PWM(ENA2, 1000)
+
+pwm_enb2 = GPIO.PWM(ENB2, 1000)
+
+pwm_ena1.start(100)
+
+pwm_enb1.start(100)
+
+pwm_ena2.start(0)
+
+pwm_enb2.start(0)
+
+cam = cv2.VideoCapture(0)
+
+
+### ---------- ФУНКЦИИ ---------- ###
+
+def measure_distance():
+
+   GPIO.output(TRIG, True)
+
+   time.sleep(0.00001)
+
+   GPIO.output(TRIG, False)
+
+   while GPIO.input(ECHO) == 0:
+
+       start = time.time()
+
+   while GPIO.input(ECHO) == 1:
+
+       end = time.time()
+
+   return (end - start) * 17150  # см
+
+
+def get_dht():
+
+   sensor = Adafruit_DHT.DHT22
+
+   hum, temp = Adafruit_DHT.read_retry(sensor, DHT_PIN)
+
+   return hum, temp
+
+
+def detect_water(frame):
+
+   hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+   lower_blue = (80, 60, 60)
+
+   upper_blue = (140, 255, 255)
+
+   mask = cv2.inRange(hsv, lower_blue, upper_blue)
+
+   area = cv2.countNonZero(mask)
+
+   return area > 4000
+
+
+### ---------- Движение ---------- ###
+
+def forward():
+
+   # ENA1/ENB1 уже включены 100%
+
+   GPIO.output(IN1, True)
+
+   GPIO.output(IN2, False)
+
+   GPIO.output(IN3, True)
+
+   GPIO.output(IN4, False)
+
+
+def stop_move():
+
+   GPIO.output(IN1, False)
+
+   GPIO.output(IN2, False)
+
+   GPIO.output(IN3, False)
+
+   GPIO.output(IN4, False)
+
+
+### ---------- Водяные моторы ---------- ###
+
+def water_motors_on():
+
+   pwm_ena2.ChangeDutyCycle(100)
+
+   pwm_enb2.ChangeDutyCycle(100)
+
+   GPIO.output(W1_IN1, True)
+
+   GPIO.output(W1_IN2, False)
+
+   GPIO.output(W2_IN1, True)
+
+   GPIO.output(W2_IN2, False)
+
+
+def water_motors_off():
+
+   pwm_ena2.ChangeDutyCycle(0)
+
+   pwm_enb2.ChangeDutyCycle(0)
+
+   GPIO.output(W1_IN1, False)
+
+   GPIO.output(W1_IN2, False)
+
+   GPIO.output(W2_IN1, False)
+
+   GPIO.output(W2_IN2, False)
+
+
+### ---------- Отправка данных ---------- ###
+
+def send_to_server(data, frame):
+
+   _, img_encoded = cv2.imencode('.jpg', frame)
+
+   requests.post(SERVER_URL,
+
+                 files={"image": img_encoded.tobytes()},
+
+                 data=data)
+
+
+### ---------- ОСНОВНОЙ ЦИКЛ ---------- ###
+
+try:
+
+   while True:
+
+       ret, frame = cam.read()
+
+       distance = measure_distance()
+
+       hum, temp = get_dht()
+
+       water = detect_water(frame)
+
+       if water:
+
+           water_motors_on()
+
+       else:
+
+           water_motors_off()
+
+       forward()
+
+       time.sleep(0.2)
+
+       send_to_server({
+
+           "distance": distance,
+
+           "humidity": hum,
+
+           "temperature": temp,
+
+           "water": int(water)
+
+       }, frame)
+
+except KeyboardInterrupt:
+
+   pwm_ena1.stop()
+
+   pwm_enb1.stop()
+
+   pwm_ena2.stop()
+
+   pwm_enb2.stop()
+
+   GPIO.cleanup()
+
+   cam.release()
+ 
