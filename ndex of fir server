@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YOLO + MAP</title>
+    <style>
+        body {
+            display: flex;
+            gap: 20px;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+        }
+        #video {
+            border: 2px solid #000;
+        }
+        #mapCanvas {
+            border: 2px solid #000;
+        }
+    </style>
+</head>
+<body>
+    <div>
+        <h3>Видео + YOLO</h3>
+        <img id="video" src="/video" width="640" height="480" />
+    </div>
+
+    <div>
+        <h3>2D Map</h3>
+        <canvas id="mapCanvas" width="600" height="600"></canvas>
+    </div>
+
+    <script>
+        const canvas = document.getElementById("mapCanvas");
+        const ctx = canvas.getContext("2d");
+
+        const centerX = canvas.width / 2;
+        const centerY = canvas.height / 2;
+
+        function drawMap(data) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // сетка
+            ctx.strokeStyle = "#ddd";
+            for (let i = 0; i < canvas.width; i += 50) {
+                ctx.beginPath();
+                ctx.moveTo(i, 0);
+                ctx.lineTo(i, canvas.height);
+                ctx.stroke();
+            }
+            for (let j = 0; j < canvas.height; j += 50) {
+                ctx.beginPath();
+                ctx.moveTo(0, j);
+                ctx.lineTo(canvas.width, j);
+                ctx.stroke();
+            }
+
+            // траектория
+            ctx.strokeStyle = "#00f";
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            data.trajectory.forEach((p, idx) => {
+                const x = centerX + (p[0] - data.x);
+                const y = centerY + (p[1] - data.y);
+                if (idx === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+
+            // текущая позиция
+            ctx.fillStyle = "#f00";
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, 6, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        async function update() {
+            const res = await fetch("/map");
+            const data = await res.json();
+            drawMap(data);
+        }
+
+        setInterval(update, 100);
+    </script>
+</body>
+</html>
