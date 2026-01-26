@@ -1,0 +1,175 @@
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+app = FastAPI()
+
+# Статика
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# YOLO
+model = YOLO("yolov8s.pt")
+
+# Камера
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FPS, 30)
+
+# Для карты
+prev_gray = None
+pos_x, pos_y = 300, 300
+trajectory = []
+
+@app.get("/")
+def root():
+    # Возвращаем HTML прямо из FastAPI (одна страница)
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>YOLO + MAP</title>
+        <style>
+            body {
+                display: flex;
+                gap: 20px;
+                padding: 20px;
+                font-family: Arial, sans-serif;
+            }
+            #video {
+                border: 2px solid #000;
+            }
+            #mapCanvas {
+                border: 2px solid #000;
+            }
+        </style>
+    </head>
+    <body>
+        <div>
+            <h3>Видео + YOLO</h3>
+            <img id="video" src="/video" width="640" height="480" />
+        </div>
+
+        <div>
+            <h3>2D Map</h3>
+            <canvas id="mapCanvas" width="600" height="600"></canvas>
+        </div>
+
+        <script>
+            const canvas = document.getElementById("mapCanvas");
+            const ctx = canvas.getContext("2d");
+
+            const centerX = canvas.width / 2;
+            const centerY = canvas.height / 2;
+
+            function drawMap(data) {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                // сетка
+                ctx.strokeStyle = "#ddd";
+                for (let i = 0; i < canvas.width; i += 50) {
+                    ctx.beginPath();
+                    ctx.moveTo(i, 0);
+                    ctx.lineTo(i, canvas.height);
+                    ctx.stroke();
+                }
+                for (let j = 0; j < canvas.height; j += 50) {
+                    ctx.beginPath();
+                    ctx.moveTo(0, j);
+                    ctx.lineTo(canvas.width, j);
+                    ctx.stroke();
+                }
+
+                // траектория
+                ctx.strokeStyle = "#00f";
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                data.trajectory.forEach((p, idx) => {
+                    const x = centerX + (p[0] - data.x);
+                    const y = centerY + (p[1] - data.y);
+                    if (idx === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                });
+                ctx.stroke();
+
+                // текущая позиция
+                ctx.fillStyle = "#f00";
+                ctx.beginPath();
+                ctx.arc(centerX, centerY, 6, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            async function update() {
+                const res = await fetch("/map");
+                const data = await res.json();
+                drawMap(data);
+            }
+
+            setInterval(update, 100);
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+# ===== STREAM =====
+def generate_frames():
+    global prev_gray, pos_x, pos_y
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # optical flow
+        if prev_gray is not None:
+            flow = cv2.calcOpticalFlowFarneback(
+                prev_gray, gray,
+                None, 0.5, 3, 15, 3, 5, 1.2, 0
+            )
+            dx, dy = np.mean(flow[..., 0]), np.mean(flow[..., 1])
+            pos_x += int(dx * 5)
+            pos_y += int(dy * 5)
+            trajectory.append((pos_x, pos_y))
+
+        prev_gray = gray
+
+        # YOLO
+        results = model(frame, conf=0.4)[0]
+        for box in results.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cls = int(box.cls)
+            label = model.names[cls]
+            conf = float(box.conf)
+
+            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+            cv2.putText(frame, f"{label} {conf:.2f}",
+                        (x1, y1-5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0,255,0), 2)
+
+        _, buffer = cv2.imencode(".jpg", frame)
+        frame = buffer.tobytes()
+
+        yield (b"--frame\r\n"
+               b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+
+@app.get("/video")
+def video():
+    return StreamingResponse(
+        generate_frames(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+
+@app.get("/map")
+def get_map():
+    return JSONResponse({
+        "x": pos_x,
+        "y": pos_y,
+        "trajectory": trajectory[-500:]
+    })
