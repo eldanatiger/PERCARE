@@ -1,0 +1,210 @@
+import time
+import math
+import requests
+import serial
+import board
+import busio
+import adafruit_bmp280
+from gpiozero import PWMOutputDevice, OutputDevice, DistanceSensor
+from mpu6050 import mpu6050
+
+# ================= CONFIGURATION =================
+SERVER_IP = "192.168.137.1"
+SERVER_PORT = 8000
+API_TELEMETRY = f"http://{SERVER_IP}:{SERVER_PORT}/api/telemetry"
+API_COMMAND = f"http://{SERVER_IP}:{SERVER_PORT}/api/get_command"
+
+# Serial Configuration (Arduino)
+SERIAL_PORT = '/dev/ttyACM0' 
+BAUD_RATE = 9600
+
+# Robot Physics
+SPEED_MPS = 0.5  # Speed in meters per second
+UPDATE_INTERVAL = 0.1 # Loop interval (10Hz)
+
+# ================= HARDWARE SETUP =================
+
+# 1. MOTORS (GPIO)
+pwm_left = PWMOutputDevice(12)
+in1 = OutputDevice(17)
+in2 = OutputDevice(27)
+
+pwm_right = PWMOutputDevice(13)
+in3 = OutputDevice(5)
+in4 = OutputDevice(6)
+
+# 2. I2C SENSORS (BMP280 & MPU6050)
+# Initialize I2C bus (SCL=GPIO3, SDA=GPIO2)
+i2c = board.I2C() 
+
+# BMP280 (Pressure Sensor)
+try:
+    # Address is usually 0x76 or 0x77
+    bmp = adafruit_bmp280.Adafruit_BMP280_I2C(i2c, address=0x76)
+    bmp.sea_level_pressure = 1013.25
+    print("[*] BMP280 initialized.")
+except Exception as e:
+    bmp = None
+    print(f"[!] BMP280 error: {e}")
+
+# MPU6050 (Gyroscope)
+try:
+    gyro = mpu6050(0x68)
+    print("[*] MPU6050 initialized.")
+except:
+    gyro = None
+    print("[!] MPU6050 not found.")
+
+# 3. ULTRASONIC SENSOR (HC-SR04)
+try:
+    # Echo=24, Trigger=23. Limit distance to 2.0m to prevent freezing
+    sonar = DistanceSensor(echo=24, trigger=23, max_distance=2.0)
+except:
+    sonar = None
+    print("[!] Sonar error.")
+
+# 4. SERIAL CONNECTION (Arduino)
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+    ser.reset_input_buffer()
+    print(f"[*] Serial connected on {SERIAL_PORT}")
+except:
+    ser = None
+    print("[!] Serial connection failed.")
+
+# ================= STATE VARIABLES =================
+robot_state = {
+    "x": 0.0, 
+    "y": 0.0, 
+    "angle_rad": 0.0,
+    "mq3": 0, "mq6": 0, "mq9": 0,
+    "temp": 0.0, "hum": 0.0, "pressure": 0.0
+}
+
+def set_motors(command):
+    """
+    Controls motor direction and returns estimated velocity.
+    """
+    speed = 0.8
+    if command == "forward":
+        in1.on(); in2.off(); in3.on(); in4.off()
+        pwm_left.value = speed; pwm_right.value = speed
+        return SPEED_MPS
+    elif command == "backward":
+        in1.off(); in2.on(); in3.off(); in4.on()
+        pwm_left.value = speed; pwm_right.value = speed
+        return -SPEED_MPS
+    elif command == "left":
+        in1.off(); in2.on(); in3.on(); in4.off()
+        pwm_left.value = speed; pwm_right.value = speed
+        return 0 # Rotation only
+    elif command == "right":
+        in1.on(); in2.off(); in3.off(); in4.on()
+        pwm_left.value = speed; pwm_right.value = speed
+        return 0 # Rotation only
+    else:
+        in1.off(); in2.off(); in3.off(); in4.off()
+        pwm_left.value = 0; pwm_right.value = 0
+        return 0
+
+# ================= MAIN LOOP =================
+print("[*] System Started. Press Ctrl+C to stop.")
+
+try:
+    while True:
+        loop_start = time.time()
+
+        # --- 1. GET COMMAND FROM SERVER ---
+        current_velocity = 0.0
+        try:
+            r = requests.get(API_COMMAND, timeout=0.02)
+            if r.status_code == 200:
+                cmd = r.json().get("command", "stop")
+                current_velocity = set_motors(cmd)
+        except:
+            set_motors("stop")
+
+        # --- 2. READ GYROSCOPE ---
+        z_rotation = 0.0
+        if gyro:
+            try:
+                gyro_data = gyro.get_gyro_data()
+                z_rotation = gyro_data['z']
+                # Noise filter: ignore spikes above 400
+                if abs(z_rotation) > 400: 
+                    z_rotation = 0 
+            except: pass
+        
+        # --- 3. READ SONAR ---
+        dist_m = 0.0
+        if sonar:
+            try:
+                dist_m = sonar.distance
+            except: pass
+
+        # --- 4. CALCULATE POSITION (SLAM) ---
+        dt = UPDATE_INTERVAL
+        
+        # Update Angle
+        robot_state["angle_rad"] += math.radians(z_rotation * dt)
+        
+        # Update X, Y
+        robot_state["x"] += current_velocity * dt * math.cos(robot_state["angle_rad"])
+        robot_state["y"] += current_velocity * dt * math.sin(robot_state["angle_rad"])
+
+        # Calculate Obstacle Coordinates
+        obs_x, obs_y = None, None
+        if 0.02 < dist_m < 1.5:
+            obs_x = robot_state["x"] + dist_m * math.cos(robot_state["angle_rad"])
+            obs_y = robot_state["y"] + dist_m * math.sin(robot_state["angle_rad"])
+
+        # --- 5. READ BMP280 (PRESSURE) ---
+        if bmp:
+            try:
+                robot_state["pressure"] = round(bmp.pressure, 2)
+                # Note: We get Temp/Hum from Arduino (DHT11), but BMP sends pressure
+            except: pass
+
+        # --- 6. READ ARDUINO (GAS + DHT11) ---
+        # Expected format: mq6, mq9, mq3, temp, hum
+        if ser and ser.in_waiting > 0:
+            try:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                parts = line.split(',')
+                if len(parts) >= 5:
+                    robot_state["mq6"] = int(parts[0])
+                    robot_state["mq9"] = int(parts[1])
+                    robot_state["mq3"] = int(parts[2])
+                    robot_state["temp"] = float(parts[3])
+                    robot_state["hum"] = float(parts[4])
+            except: pass
+
+        # --- 7. PREPARE PAYLOAD ---
+        payload = {
+            "x": round(robot_state["x"], 3),
+            "y": round(robot_state["y"], 3),
+            "angle_deg": round(math.degrees(robot_state["angle_rad"]), 1),
+            "temp": robot_state["temp"],
+            "hum": robot_state["hum"],
+            "pressure": robot_state["pressure"],
+            "mq3": robot_state["mq3"],
+            "mq6": robot_state["mq6"],
+            "mq9": robot_state["mq9"],
+            "obstacle_x": round(obs_x, 3) if obs_x else None,
+            "obstacle_y": round(obs_y, 3) if obs_y else None
+        }
+
+        # --- 8. SEND TELEMETRY ---
+        try:
+            requests.post(API_TELEMETRY, json=payload, timeout=0.02)
+        except: pass
+
+        # --- 9. MAINTAIN LOOP TIMING ---
+        elapsed = time.time() - loop_start
+        if elapsed < UPDATE_INTERVAL:
+            time.sleep(UPDATE_INTERVAL - elapsed)
+
+except KeyboardInterrupt:
+    set_motors("stop")
+    if ser: ser.close()
+    print("\n[!] Program Stopped.")
