@@ -1,0 +1,481 @@
+import cv2
+import uvicorn
+import numpy as np
+import time
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from ultralytics import YOLO
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from typing import Optional, List, Dict
+import threading
+import queue
+import logging
+from collections import deque
+
+# --- ⚙️ НАСТРОЙКИ ---
+# Если Raspberry Pi камера: используйте 0 для встроенной, или IP для удаленной
+VIDEO_SOURCE ="http://192.168.137.113:5000/video_feed"  
+app = FastAPI(title="Robo-Vision Ultimate 4.0")  # Обновили версию
+
+# --- 💾 СОСТОЯНИЕ РОБОТА ---
+robot_state = {
+    "x": 0.0, "y": 0.0, "z": 0.0,  # Добавили Z для возможного 3D
+    "angle": 0.0, "pitch": 0.0, "roll": 0.0,  # Добавили pitch/roll от MPU
+    "temp": 24.5, "hum": 40.0, "pressure": 1013.0,
+    "mq3": 10, "mq6": 15, "mq9": 5,
+    "battery": 100.0,  # Добавили батарею
+    "speed": 0.0  # Добавили скорость
+}
+robot_path = deque(maxlen=2000)  # Используем deque для эффективности
+obstacles = []  # Список препятствий с timestamp для очистки старых
+current_command = "stop"
+command_queue = queue.Queue()  # Очередь команд для асинхронной обработки
+
+# --- 🧠 ИНИЦИАЛИЗАЦИЯ ИИ ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.info("🚀 Загрузка системы...")
+model = YOLO("yolov8n.pt")  # Можно заменить на custom модель, напр. "best.pt"
+cap = cv2.VideoCapture(VIDEO_SOURCE)
+
+# --- 📦 МОДЕЛИ ДАННЫХ ---
+class TelemetryData(BaseModel):
+    x: float
+    y: float
+    z: Optional[float] = 0.0  # Добавили Z
+    angle_deg: float
+    pitch: Optional[float] = 0.0
+    roll: Optional[float] = 0.0
+    temp: float
+    hum: float
+    pressure: float
+    mq3: int
+    mq6: int
+    mq9: int
+    battery: Optional[float] = 100.0
+    speed: Optional[float] = 0.0
+    obstacles: Optional[List[Dict[str, float]]] = None  # Список препятствий: [{"x": float, "y": float, "dist": float, "timestamp": float}]
+
+class CommandData(BaseModel):
+    command: str
+    params: Optional[Dict] = None  # Добавили параметры, напр. {"target_x": 10, "target_y": 20}
+
+# --- 🔌 API ENDPOINTS ---
+@app.post("/api/telemetry")
+async def receive_telemetry(data: TelemetryData):
+    global robot_state, robot_path, obstacles
+    try:
+        robot_state.update(data.dict(exclude={"obstacles"}))
+        
+        # Логика пути (добавляем точку с фильтрацией шума)
+        current_pos = {"x": data.x, "y": data.y, "z": data.z or 0.0, "timestamp": time.time()}
+        if not robot_path or np.linalg.norm(np.array([robot_path[-1]["x"] - data.x, robot_path[-1]["y"] - data.y])) > 0.05:
+            robot_path.append(current_pos)
+        
+        # Обработка препятствий (добавляем с timestamp, удаляем старые > 60 сек)
+        if data.obstacles:
+            current_time = time.time()
+            obstacles.extend([{"x": o["x"], "y": o["y"], "dist": o.get("dist", 0), "timestamp": current_time} for o in data.obstacles])
+            obstacles = [o for o in obstacles if current_time - o["timestamp"] < 60]
+        
+        return {"status": "synced"}
+    except Exception as e:
+        logger.error(f"Telemetry error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/map_data")
+async def get_map_data():
+    return {"state": robot_state, "path": list(robot_path), "obstacles": obstacles}
+
+@app.post("/api/move")
+async def send_command(data: CommandData):
+    global current_command
+    current_command = data.command
+    command_queue.put(data)  # Добавляем в очередь для обработки
+    return {"status": "ok"}
+
+@app.get("/api/get_command")
+async def get_command():
+    try:
+        cmd = command_queue.get_nowait()
+        return {"command": cmd.command, "params": cmd.params}
+    except queue.Empty:
+        return {"command": "stop"}
+
+@app.post("/api/reset")
+async def reset_map():
+    global robot_path, obstacles
+    robot_path.clear()
+    obstacles = []
+    return {"status": "cleared"}
+
+@app.get("/api/health")
+async def health_check():
+    return {"status": "healthy", "uptime": time.time() - start_time}
+
+# --- 🎥 ВИДЕО ПОТОК (С АВТО-РЕКОННЕКТОМ И УЛУЧШЕННОЙ ПРОИЗВОДИТЕЛЬНОСТЬЮ) ---
+start_time = time.time()
+def generate_frames():
+    global cap
+    frame_counter = 0
+    last_annotated_frame = None
+    while True:
+        try:
+            success, frame = cap.read()
+            if not success:
+                cap.release()
+                time.sleep(1)
+                cap = cv2.VideoCapture(VIDEO_SOURCE)
+                continue
+            frame_counter += 1
+            
+            # YOLO каждые 5 кадров для оптимизации (было 3)
+            if frame_counter % 5 == 0:
+                results = model(frame, conf=0.5, verbose=False)[0]
+                last_annotated_frame = results.plot()
+            
+            display_frame = last_annotated_frame if last_annotated_frame is not None else frame
+            
+            # Улучшенное сжатие: адаптивное качество
+            quality = 75 if frame_counter % 2 == 0 else 60
+            ret, buffer = cv2.imencode('.jpg', display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            if not ret: continue
+            
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+        except Exception as e:
+            logger.error(f"Frame error: {e}")
+            time.sleep(1)
+
+@app.get("/video_feed")
+async def video_feed():
+    return StreamingResponse(generate_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+# --- 🎨 ГРАФИЧЕСКИЙ ИНТЕРФЕЙС (УЛУЧШЕННЫЙ HTML/JS/CSS) ---
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return """
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+        <meta charset="UTF-8">
+        <title>Robo-Vision ULTIMATE 4.0</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
+        <style>
+            :root {
+                --bg: #050505;
+                --card-bg: #101214;
+                --text-main: #e0e0e0;
+                --text-dim: #777;
+                --border: #222;
+                --accent: #00d9ff;
+                --danger: #ff003c;
+                --safe: #00ff9d;
+                --warn: #ffbd00;
+            }
+            body {
+                background: var(--bg);
+                color: var(--text-main);
+                font-family: 'Roboto Mono', monospace;
+                margin: 0;
+                height: 100vh;
+                overflow: hidden;
+            }
+            .dashboard {
+                display: grid;
+                grid-template-columns: 1.5fr 1fr;
+                grid-template-rows: 55vh 45vh;
+                gap: 10px;
+                padding: 10px;
+                height: 100vh;
+                box-sizing: border-box;
+            }
+            .panel {
+                background: var(--card-bg);
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                padding: 10px;
+                display: flex;
+                flex-direction: column;
+                position: relative;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            }
+            .panel-header {
+                font-family: 'Orbitron', sans-serif;
+                font-size: 14px;
+                color: var(--accent);
+                text-transform: uppercase;
+                margin-bottom: 8px;
+                border-bottom: 1px solid #222;
+                padding-bottom: 5px;
+                display: flex;
+                justify-content: space-between;
+            }
+            .video-box {
+                flex: 1;
+                background: #000;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                border-radius: 4px;
+                overflow: hidden;
+                border: 1px solid #333;
+            }
+            .video-box img { max-width: 100%; max-height: 100%; }
+            .sensors-container {
+                grid-column: 1 / 3;
+                display: grid;
+                grid-template-columns: repeat(7, 1fr);  /* Добавили 7 для батареи */
+                gap: 8px;
+            }
+            .sensor-card {
+                background: #161b22;
+                border: 1px solid #333;
+                border-radius: 5px;
+                padding: 8px;
+                display: flex;
+                flex-direction: column;
+                transition: all 0.2s;
+            }
+            .val-display {
+                font-family: 'Orbitron', sans-serif;
+                font-size: 24px;
+                font-weight: bold;
+                color: #fff;
+                margin: 5px 0;
+            }
+            .unit { font-size: 10px; color: var(--text-dim); margin-left: 2px; }
+            .chart-wrapper { flex: 1; min-height: 0; position: relative; }
+            canvas { width: 100% !important; height: 100% !important; }
+            .alert-mode {
+                border-color: var(--danger);
+                box-shadow: 0 0 15px rgba(255, 0, 60, 0.3) inset;
+                animation: pulse 1s infinite;
+            }
+            @keyframes pulse { 50% { border-color: transparent; box-shadow: none; } }
+            .cmd-badge {
+                position: absolute; top: 15px; right: 15px;
+                background: rgba(0,0,0,0.8); color: var(--accent);
+                padding: 5px 10px; border-radius: 4px; font-weight: bold; font-family: 'Orbitron';
+            }
+            /* Улучшения для карты: zoom/pan */
+            #mapCanvas { cursor: grab; }
+        </style>
+    </head>
+    <body>
+        <div class="dashboard">
+            <div class="panel">
+                <div class="panel-header">Vision System <span style="font-size:10px; color:#555">LIVE FEED</span></div>
+                <div class="video-box">
+                    <img src="/video_feed" onerror="this.src='https://via.placeholder.com/800x600?text=NO+SIGNAL'">
+                </div>
+                <div class="cmd-badge">CMD: <span id="cmdText">STOP</span></div>
+            </div>
+            <div class="panel">
+                <div class="panel-header">
+                    Lidar/IMU Map
+                    <button onclick="resetMap()" style="background:none; border:none; color:var(--danger); cursor:pointer; font-size:10px;">[CLEAR]</button>
+                </div>
+                <canvas id="mapCanvas" style="background: #090a0c; border-radius:4px;"></canvas>
+            </div>
+            <div class="sensors-container">
+                <div class="sensor-card" id="card-mq3">
+                    <div style="font-size:10px; color:#aaa;">MQ-3 (СПИРТ/ЭТАНОЛ)</div>
+                    <div class="val-display"><span id="val-mq3">0</span><span class="unit">ppm</span></div>
+                    <div class="chart-wrapper"><canvas id="chart-mq3"></canvas></div>
+                </div>
+                <div class="sensor-card" id="card-mq6">
+                    <div style="font-size:10px; color:#aaa;">MQ-6 (ПРОПАН/БУТАН)</div>
+                    <div class="val-display"><span id="val-mq6">0</span><span class="unit">ppm</span></div>
+                    <div class="chart-wrapper"><canvas id="chart-mq6"></canvas></div>
+                </div>
+                <div class="sensor-card" id="card-mq9">
+                    <div style="font-size:10px; color:#aaa;">MQ-9 (УГАРНЫЙ ГАЗ)</div>
+                    <div class="val-display"><span id="val-mq9">0</span><span class="unit">ppm</span></div>
+                    <div class="chart-wrapper"><canvas id="chart-mq9"></canvas></div>
+                </div>
+                <div class="sensor-card" id="card-temp">
+                    <div style="font-size:10px; color:#aaa;">ТЕМПЕРАТУРА</div>
+                    <div class="val-display"><span id="val-temp">0</span><span class="unit">°C</span></div>
+                    <div class="chart-wrapper"><canvas id="chart-temp"></canvas></div>
+                </div>
+                <div class="sensor-card" id="card-hum">
+                    <div style="font-size:10px; color:#aaa;">ВЛАЖНОСТЬ</div>
+                    <div class="val-display"><span id="val-hum">0</span><span class="unit">%</span></div>
+                    <div class="chart-wrapper"><canvas id="chart-hum"></canvas></div>
+                </div>
+                <div class="sensor-card" id="card-press">
+                    <div style="font-size:10px; color:#aaa;">ДАВЛЕНИЕ</div>
+                    <div class="val-display"><span id="val-press">0</span><span class="unit">hPa</span></div>
+                    <div class="chart-wrapper"><canvas id="chart-press"></canvas></div>
+                </div>
+                <div class="sensor-card" id="card-battery">
+                    <div style="font-size:10px; color:#aaa;">БАТАРЕЯ</div>
+                    <div class="val-display"><span id="val-battery">100</span><span class="unit">%</span></div>
+                    <div class="chart-wrapper"><canvas id="chart-battery"></canvas></div>
+                </div>
+            </div>
+        </div>
+        <script>
+            // --- НАСТРОЙКИ (LIMITS) ---
+            const CONFIG = {
+                mq3: { limit: 200, color: '#a855f7' },
+                mq6: { limit: 150, color: '#f59e0b' },
+                mq9: { limit: 150, color: '#ef4444' },
+                temp: { limit: 40, color: '#f43f5e' },
+                hum: { limit: 90, color: '#3b82f6' },
+                press: { limit: 0, color: '#10b981' },
+                battery: { limit: 20, color: '#22c55e' }  // Тревога при <20%
+            };
+            // --- ИНИЦИАЛИЗАЦИЯ ГРАФИКОВ ---
+            const charts = {};
+            function initChart(id, color) {
+                const ctx = document.getElementById(id).getContext('2d');
+                const gradient = ctx.createLinearGradient(0, 0, 0, 100);
+                gradient.addColorStop(0, color + "66");
+                gradient.addColorStop(1, "transparent");
+                return new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: Array(30).fill(''),
+                        datasets: [{
+                            data: Array(30).fill(0),
+                            borderColor: color,
+                            borderWidth: 2,
+                            backgroundColor: gradient,
+                            fill: true,
+                            pointRadius: 0,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        animation: false,
+                        plugins: { legend: { display: false } },
+                        scales: {
+                            x: { display: false },
+                            y: { display: false, min: 0 }
+                        }
+                    }
+                });
+            }
+            charts.mq3 = initChart('chart-mq3', CONFIG.mq3.color);
+            charts.mq6 = initChart('chart-mq6', CONFIG.mq6.color);
+            charts.mq9 = initChart('chart-mq9', CONFIG.mq9.color);
+            charts.temp = initChart('chart-temp', CONFIG.temp.color);
+            charts.hum = initChart('chart-hum', CONFIG.hum.color);
+            charts.press = initChart('chart-press', CONFIG.press.color);
+            charts.battery = initChart('chart-battery', CONFIG.battery.color);
+            // --- УЛУЧШЕННАЯ КАРТА (С ZOOM/PAN) ---
+            const mapCanvas = document.getElementById('mapCanvas');
+            const mapCtx = mapCanvas.getContext('2d');
+            let scale = 20, offsetX = 0, offsetY = 0;
+            let isDragging = false, startX, startY;
+            mapCanvas.addEventListener('mousedown', (e) => { isDragging = true; startX = e.clientX - offsetX; startY = e.clientY - offsetY; });
+            mapCanvas.addEventListener('mousemove', (e) => { if (isDragging) { offsetX = e.clientX - startX; offsetY = e.clientY - startY; } });
+            mapCanvas.addEventListener('mouseup', () => isDragging = false);
+            mapCanvas.addEventListener('mouseleave', () => isDragging = false);
+            mapCanvas.addEventListener('wheel', (e) => { scale *= e.deltaY < 0 ? 1.1 : 0.9; scale = Math.max(5, Math.min(100, scale)); });
+            function drawMap(state, path, obstacles) {
+                mapCanvas.width = mapCanvas.offsetWidth;
+                mapCanvas.height = mapCanvas.offsetHeight;
+                const w = mapCanvas.width, h = mapCanvas.height;
+                mapCtx.fillStyle = "#090a0c"; mapCtx.fillRect(0,0,w,h);
+                mapCtx.strokeStyle = "#1a1a1a"; mapCtx.lineWidth = 1;
+                mapCtx.beginPath();
+                for(let i=-w; i<w*2; i+=30) { mapCtx.moveTo(i + offsetX % 30, 0); mapCtx.lineTo(i + offsetX % 30, h); }
+                for(let i=-h; i<h*2; i+=30) { mapCtx.moveTo(0, i + offsetY % 30); mapCtx.lineTo(w, i + offsetY % 30); }
+                mapCtx.stroke();
+                mapCtx.save();
+                mapCtx.translate(w/2 + offsetX, h/2 + offsetY);
+                // Путь с градиентом цвета (новое -> старое)
+                mapCtx.lineWidth = 2;
+                for(let i=1; i<path.length; i++) {
+                    mapCtx.beginPath();
+                    mapCtx.strokeStyle = `hsl(180, 100%, ${50 + 50*(i/path.length)}%)`;
+                    mapCtx.moveTo(path[i-1].x * scale, -path[i-1].y * scale);
+                    mapCtx.lineTo(path[i].x * scale, -path[i].y * scale);
+                    mapCtx.stroke();
+                }
+                // Препятствия с размером по dist
+                obstacles.forEach(o => {
+                    mapCtx.fillStyle = "#ff003c";
+                    mapCtx.beginPath(); 
+                    const radius = Math.max(4, o.dist * scale / 10);
+                    mapCtx.arc(o.x * scale, -o.y * scale, radius, 0, Math.PI*2); 
+                    mapCtx.fill();
+                });
+                // Робот с ориентацией pitch/roll (простая визуализация)
+                mapCtx.translate(state.x * scale, -state.y * scale);
+                mapCtx.rotate(state.angle * Math.PI/180);
+                mapCtx.fillStyle = "#fff";
+                mapCtx.beginPath(); mapCtx.moveTo(0,-8); mapCtx.lineTo(-6,6); mapCtx.lineTo(6,6); mapCtx.fill();
+                // Визуализация pitch/roll как наклон
+                mapCtx.rotate(state.pitch * Math.PI/180);  // Пример
+                mapCtx.restore();
+            }
+            // --- ГЛАВНЫЙ ЦИКЛ ОБНОВЛЕНИЯ ---
+            async function update() {
+                try {
+                    const res = await fetch('/api/map_data');
+                    const data = await res.json();
+                    const s = data.state;
+                    drawMap(s, data.path, data.obstacles);
+                    const updateSensor = (key, val, limit, isLowAlert = false) => {
+                        document.getElementById('val-' + key).innerText = val;
+                        const chart = charts[key];
+                        chart.data.datasets[0].data.push(val);
+                        chart.data.datasets[0].data.shift();
+                        const card = document.getElementById('card-' + key);
+                        const alertCondition = isLowAlert ? (val <= limit) : (val >= limit);
+                        if (limit > 0 && alertCondition) {
+                            card.classList.add('alert-mode');
+                            chart.data.datasets[0].borderColor = '#ff003c';
+                        } else {
+                            card.classList.remove('alert-mode');
+                            chart.data.datasets[0].borderColor = CONFIG[key].color;
+                        }
+                        chart.update();
+                    };
+                    updateSensor('mq3', s.mq3, CONFIG.mq3.limit);
+                    updateSensor('mq6', s.mq6, CONFIG.mq6.limit);
+                    updateSensor('mq9', s.mq9, CONFIG.mq9.limit);
+                    updateSensor('temp', s.temp, CONFIG.temp.limit);
+                    updateSensor('hum', s.hum, CONFIG.hum.limit);
+                    updateSensor('press', s.pressure, 0);
+                    updateSensor('battery', s.battery, CONFIG.battery.limit, true);  // Alert if low
+                } catch (e) { console.error(e); }
+            }
+            setInterval(update, 200);  // Увеличили до 5 FPS
+            // --- УПРАВЛЕНИЕ WASD + АВТОНОМНЫЙ РЕЖИМ ---
+            const keys = {w:'forward', a:'left', s:'backward', d:'right', e:'auto'};
+            let activeKey = null;
+            document.onkeydown = (e) => {
+                const k = e.key.toLowerCase();
+                if(keys[k] && activeKey !== k) {
+                    activeKey = k;
+                    const body = {command: keys[k]};
+                    if (k === 'e') body.params = {mode: 'auto_avoid'};  // Пример автономного
+                    fetch('/api/move', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+                    document.getElementById('cmdText').innerText = keys[k].toUpperCase();
+                    document.getElementById('cmdText').style.color = '#00d9ff';
+                }
+            };
+            document.onkeyup = (e) => {
+                if(keys[e.key.toLowerCase()]) {
+                    activeKey = null;
+                    fetch('/api/move', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({command:'stop'})});
+                    document.getElementById('cmdText').innerText = "STOP";
+                    document.getElementById('cmdText').style.color = "#777";
+                }
+            };
+            async function resetMap() { fetch('/api/reset', {method:'POST'}); }
+        </script>
+    </body>
+    </html>
+    """
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
